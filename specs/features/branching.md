@@ -13,6 +13,7 @@
 
 ### Planejadas (future/)
 - SPEC-20261113-2212-branch-coerente-sem-header | 400 sem header quando há branch padrão; 1 Branch.get por requisição | anotação diverge da escrita
+- SPEC-20261114-1747-bump-netbox-branching-1-2-3 | ambiente v4.7 fixa netbox-branching 1.2.0 (antes de #672/#675)
 
 ## Estado atual
 
