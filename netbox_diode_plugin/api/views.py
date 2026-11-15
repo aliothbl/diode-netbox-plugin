@@ -8,8 +8,10 @@ import time
 from dataclasses import dataclass
 
 from django.apps import apps
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from django.db.utils import OperationalError
+from django.utils.translation import gettext
 from netbox.plugins import get_plugin_config
 from rest_framework import status, views
 from rest_framework.exceptions import ValidationError
@@ -53,6 +55,27 @@ def _extract_sqlstate(exc):
 
 def _is_deadlock(exc):
     return _extract_sqlstate(exc) == _PG_DEADLOCK_SQLSTATE
+
+
+# NetBox's ltree tree models (netbox/models/ltree.py, 4.7+) take per-tree
+# advisory locks in their triggers and translate the resulting 40P01 into a
+# Django ValidationError with this message, raised ``from None`` so the
+# SQLSTATE is no longer reachable. It is the same retryable deadlock.
+_LTREE_CONCURRENT_MSGID = "The hierarchy was modified concurrently; please retry."
+
+
+def _is_hierarchy_deadlock(exc):
+    """True for the ValidationError NetBox raises when an ltree save loses a deadlock."""
+    if not isinstance(exc, DjangoValidationError):
+        return False
+    expected = {_LTREE_CONCURRENT_MSGID, str(gettext(_LTREE_CONCURRENT_MSGID))}
+    return any(str(m) in expected for m in getattr(exc, "messages", []))
+
+
+def _is_retryable_apply_error(exc):
+    if isinstance(exc, OperationalError):
+        return _is_deadlock(exc)
+    return _is_hierarchy_deadlock(exc)
 
 
 def _db_error_code(exc):
@@ -166,8 +189,13 @@ def _apply_one_changeset_with_retry(change_set: ChangeSet, request, entity_id) -
     """
     Apply with retries on Postgres deadlock (SQLSTATE 40P01).
 
+    That includes the deadlock NetBox's ltree models report as a
+    ValidationError (see _is_hierarchy_deadlock): without it, concurrent
+    batches creating hierarchical objects (regions, locations, ...) turned a
+    whole /bulk-plan-apply response into a 500.
+
     The transaction.atomic() in _apply_one_changeset rolls back fully on
-    OperationalError, so a retry starts from a clean slate. The
+    either exception, so a retry starts from a clean slate. The
     request-scoped object cache is positive-only and remains valid across
     retries — any row it contains genuinely existed at lookup time.
     """
@@ -176,8 +204,8 @@ def _apply_one_changeset_with_retry(change_set: ChangeSet, request, entity_id) -
     while True:
         try:
             return _apply_one_changeset(change_set, request)
-        except OperationalError as e:
-            if attempt >= max_retries or not _is_deadlock(e):
+        except (OperationalError, DjangoValidationError) as e:
+            if attempt >= max_retries or not _is_retryable_apply_error(e):
                 raise
             # Jittered backoff: 25–50ms on the first retry, 75–100ms on
             # the second, etc. Small enough to stay well under the
@@ -680,6 +708,20 @@ class BulkPlanApplyView(views.APIView):
             return {
                 "change_set": change_set_dict,
                 "errors": {"apply": {"__all__": [_db_error_code(e)]}},
+            }
+        except DjangoValidationError as e:
+            # Only the ltree deadlock is handled here (retries exhausted): it
+            # belongs to this entity, not to the whole batch. Other
+            # ValidationErrors keep their previous behaviour.
+            if not _is_hierarchy_deadlock(e):
+                raise
+            logger.warning(
+                "apply phase hit hierarchy deadlock for entity %s after retries",
+                _sanitize_for_log(entry.get("id")),
+            )
+            return {
+                "change_set": change_set_dict,
+                "errors": {"apply": {"__all__": ["db_deadlock_after_retries"]}},
             }
 
         if apply_result.errors:
