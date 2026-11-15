@@ -5,6 +5,7 @@ import logging
 import random
 import re
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 from django.apps import apps
@@ -130,6 +131,33 @@ def get_valid_entity_keys(model_name):
     return (snake, lowerCamel)
 
 
+def _active_branch_atomic():
+    """
+    A transaction on the active netbox-branching branch's connection, or a no-op.
+
+    With a branch active, the objects are written through the branch schema's own database
+    connection, while transaction.atomic() alone only covers the default connection (where
+    netbox-branching keeps ChangeDiff). Without this, every write of the apply committed on its
+    own in the branch: a failed entity left its partial writes behind, and an object became
+    visible in the branch before its CREATE ChangeDiff was committed. A concurrent update of that
+    object in the meantime was then rejected by netbox-branching as "deleted in the main branch"
+    (seen while a sync of the branch held locks on the default connection for tens of seconds).
+
+    This transaction is entered first, so it is the outer one: the default connection (ChangeDiff,
+    change log, counters) commits first and the branch objects only become visible after it.
+    """
+    if Branch is None:
+        return nullcontext()
+    try:
+        from netbox_branching.contextvars import active_branch
+    except ImportError:
+        return nullcontext()
+    branch = active_branch.get()
+    if branch is None:
+        return nullcontext()
+    return transaction.atomic(using=branch.connection_name)
+
+
 def _apply_one_changeset(change_set: ChangeSet, request) -> ChangeSetResult:
     """
     Apply one changeset, returning a ChangeSetResult on success or on ChangeSetException.
@@ -172,6 +200,7 @@ def _apply_one_changeset(change_set: ChangeSet, request) -> ChangeSetResult:
     """
     try:
         with (
+            _active_branch_atomic(),
             transaction.atomic(),
             bypass_counter_updates(),
             buffered_counter_updates(),
