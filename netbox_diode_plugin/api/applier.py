@@ -12,6 +12,7 @@ from django.db import models, transaction
 from django.db.utils import IntegrityError
 from rest_framework.exceptions import ValidationError as ValidationError
 
+from .branch_transaction import active_branch_atomic
 from .change_log_buffer import snapshot_for_apply
 from .common import (
     MATCH_ONLY_TYPES,
@@ -1207,7 +1208,10 @@ def _create_or_find_instance(data: dict, object_type: str, serializer_class, req
     serializer = serializer_class(data=data, context={"request": request})
     try:
         serializer.is_valid(raise_exception=True)
-        with transaction.atomic():
+        # A savepoint on the branch connection too: the INSERT goes there when a branch is
+        # active, and without one the IntegrityError below would abort the whole branch
+        # transaction, failing the lookup that follows.
+        with active_branch_atomic(), transaction.atomic():
             return serializer.save()
     except (ValidationError, IntegrityError) as e:
         instance = _find_existing_object_or_none(data, object_type)

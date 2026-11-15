@@ -29,7 +29,6 @@ class ApplyBranchAtomicTestCase(SimpleTestCase):
         contextvar.get.return_value = branch
         with (
             mock.patch.object(views.transaction, "atomic", side_effect=fake_atomic),
-            mock.patch.object(views, "Branch", object()),
             mock.patch("netbox_branching.contextvars.active_branch", contextvar),
             mock.patch.object(views, "apply_changeset", return_value=ChangeSetResult(id="cs")),
         ):
@@ -46,3 +45,36 @@ class ApplyBranchAtomicTestCase(SimpleTestCase):
         """Without an active branch only the default connection's transaction is used."""
         entered, _ = self._run(None)
         self.assertEqual(entered, [None])
+
+
+class CreateOrFindSavepointTestCase(SimpleTestCase):
+    """The create fallback's savepoint must exist on the branch connection too."""
+
+    def test_savepoint_on_branch_connection(self):
+        """A caught IntegrityError must not abort the branch transaction: a branch savepoint wraps the save."""
+        from django.db import IntegrityError
+
+        from netbox_diode_plugin.api import applier
+
+        entered = []
+
+        @contextmanager
+        def fake_atomic(using=None):
+            entered.append(using)
+            yield
+
+        contextvar = mock.Mock()
+        contextvar.get.return_value = _FakeBranch()
+        serializer = mock.Mock()
+        serializer.save.side_effect = IntegrityError("duplicate key")
+        existing = object()
+        with (
+            mock.patch.object(applier.transaction, "atomic", side_effect=fake_atomic),
+            mock.patch("netbox_branching.contextvars.active_branch", contextvar),
+            mock.patch.object(applier, "_find_existing_object_or_none", return_value=existing),
+        ):
+            result = applier._create_or_find_instance(
+                {"name": "bench"}, "extras.tag", lambda data, context: serializer, mock.Mock()
+            )
+        self.assertIs(result, existing)
+        self.assertEqual(entered, ["schema_branch_abc", None])
