@@ -51,6 +51,13 @@ def exit_request_obj_cache(token):
     _request_obj_cache.reset(token)
 
 
+def clear_request_obj_cache():
+    """Forget every row the request-scoped cache holds (a re-plan after StalePlan)."""
+    cache = _request_obj_cache.get(None)
+    if cache:
+        cache.clear()
+
+
 def _get_find_obj_cache_ttl() -> int:
     return get_plugin_config("netbox_diode_plugin", "find_obj_cache_ttl")
 

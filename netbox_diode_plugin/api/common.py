@@ -119,6 +119,13 @@ class Change:
     # Informational: None on models without tags, or when a ref does not
     # resolve. Not read back by the applier.
     tags_resolved: list[dict] | None = field(default=None)
+    # Plan-time facts for the auto-apply guards (apply_guard.py); never
+    # serialized. planned_last_updated: the object's last_updated when the
+    # plan read it (None for creates). asserted: the fields the ingested
+    # entity itself carried for this object, before the plan merged in the
+    # object's current values.
+    planned_last_updated: object = field(default=None, repr=False, compare=False)
+    asserted: frozenset | None = field(default=None, repr=False, compare=False)
 
     def to_dict(self) -> dict:
         """Convert the change to a dictionary."""

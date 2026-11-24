@@ -48,6 +48,13 @@ def exit_prechange_cache(token):
     _prechange_cache.reset(token)
 
 
+def clear_prechange_cache():
+    """Forget every cached prechange snapshot (a re-plan after StalePlan)."""
+    cache = _prechange_cache.get(None)
+    if cache:
+        cache.clear()
+
+
 @profiled("prechange_data")
 def prechange_data_from_instance(instance) -> dict: # noqa: C901
     """Convert model instance data to a dictionary format for comparison."""
@@ -249,6 +256,21 @@ def sort_dict_recursively(d):
         return [sort_dict_recursively(item) for item in d]
     return d
 
+def _guard_facts(entity: dict, instance) -> tuple[frozenset, object]:
+    """
+    Plan-time facts apply_guard.py checks at apply time.
+
+    The fields the ingested entity asserted, taken before the plan merges the
+    object's current values in, and the object's last_updated as read now
+    (None for an object this changeset creates).
+    """
+    asserted = frozenset(k for k in entity if not k.startswith("_"))
+    planned = None
+    if instance and not isinstance(instance, str):
+        planned = getattr(instance, "last_updated", None)
+    return asserted, planned
+
+
 def generate_changeset(entity: dict, object_type: str) -> ChangeSetResult:
     """Generate a changeset for an entity."""
     try:
@@ -283,6 +305,7 @@ def _generate_changeset(entity: dict, object_type: str) -> ChangeSetResult:
         instance = entity.pop("_instance", None)
         entity.pop("_netbox_id", None)
         _merge_warnings(warnings, object_type, entity.pop("_warnings", None))
+        asserted, planned_last_updated = _guard_facts(entity, instance)
         if instance:
             # the prior state is another new object...
             if isinstance(instance, str):
@@ -308,6 +331,8 @@ def _generate_changeset(entity: dict, object_type: str) -> ChangeSetResult:
             changed_attrs,
             new_refs,
         )
+        change.asserted = asserted
+        change.planned_last_updated = planned_last_updated
 
         change_set.changes.append(change)
 

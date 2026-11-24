@@ -109,3 +109,39 @@ class ClientCredentials(models.Model):
             ("add_clientcredentials", "Can perform actions on Client Credentials"),
         )
 
+
+
+class ObjectObservation(models.Model):
+    """
+    Newest Diode observation applied to each field of a NetBox object.
+
+    Written only by the /bulk-plan-apply/ path (api/apply_guard.py), so an
+    older observation of a field cannot overwrite a newer one when batches
+    are applied concurrently. ``fields`` maps a field name to the
+    ``observed_at`` (epoch milliseconds, from the reconciler) of the last
+    applied entity that asserted it.
+
+    A plain model, like Setting: no change logging, never copied into a
+    netbox-branching branch. Rows of different branches are told apart by
+    ``branch`` (the branch schema id, "" for main).
+    """
+
+    branch = models.CharField(max_length=100, default="", blank=True)
+    object_type = models.CharField(max_length=100)
+    object_id = models.BigIntegerField()
+    fields = models.JSONField(default=dict)
+
+    class Meta:
+        """Meta class."""
+
+        default_permissions = ()
+        constraints = [
+            models.UniqueConstraint(
+                fields=("branch", "object_type", "object_id"),
+                name="netbox_diode_plugin_objectobservation_unique",
+            ),
+        ]
+
+    def __str__(self):
+        """Return string representation."""
+        return f"{self.object_type}:{self.object_id}@{self.branch or 'main'}"

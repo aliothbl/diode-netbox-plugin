@@ -12,6 +12,7 @@ from django.db import models, transaction
 from django.db.utils import IntegrityError
 from rest_framework.exceptions import ValidationError as ValidationError
 
+from .apply_guard import drop_superseded_fields, get_for_update, record_observation, still_writes
 from .branch_transaction import active_branch_atomic
 from .change_log_buffer import snapshot_for_apply
 from .common import (
@@ -1298,6 +1299,25 @@ def _refuse_write_through_bound_ref(change: Change, bound_only: dict) -> None:
     )
 
 
+def _update_by_id(data: dict, model_class: models.Model, change: Change, serializer_class, request):
+    """
+    UPDATE of an existing row addressed by object_id.
+
+    apply_guard locks the row, refuses a stale plan and keeps the fields a
+    newer observation already wrote; outside /bulk-plan-apply/ these are no-ops.
+    """
+    instance = get_for_update(model_class, change)
+    data, observation, dropped = drop_superseded_fields(change, data)
+    if not still_writes(change, data, dropped):
+        return
+    snapshot_for_apply(instance)
+    serializer = serializer_class(instance, data=data, partial=True, context={"request": request})
+    serializer.is_valid(raise_exception=True)
+    serializer.save()
+    invalidate_find_obj_entry(change.object_type, instance.id)
+    record_observation(change, instance.id, observation)
+
+
 def _apply_change(data: dict, model_class: models.Model, change: Change, created: dict, request,
                   change_set: ChangeSet, warnings: list | None = None,
                   bound_only: dict | None = None):
@@ -1359,13 +1379,8 @@ def _apply_change(data: dict, model_class: models.Model, change: Change, created
             _record_bound_only(bound_only, change, pre_save_matched)
 
     elif change_type == ChangeType.UPDATE:
-        if object_id := change.object_id:
-            instance = model_class.objects.get(id=object_id)
-            snapshot_for_apply(instance)
-            serializer = serializer_class(instance, data=data, partial=True, context={"request": request})
-            serializer.is_valid(raise_exception=True)
-            serializer.save()
-            invalidate_find_obj_entry(change.object_type, instance.id)
+        if change.object_id:
+            _update_by_id(data, model_class, change, serializer_class, request)
         # create and update in a same change set
         elif change.ref_id and (created_instance := created[change.ref_id]):
             _refuse_write_through_bound_ref(change, bound_only)

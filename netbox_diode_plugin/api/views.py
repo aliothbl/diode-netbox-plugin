@@ -19,6 +19,7 @@ from rest_framework.response import Response
 
 from . import customfield_cache  # noqa: F401 - imported for side-effect install at module load
 from .applier import apply_changeset
+from .apply_guard import StalePlan, apply_guard, parse_observed_at
 from .authentication import DiodeOAuth2Authentication
 from .branch_transaction import active_branch_atomic
 from .change_log_buffer import buffered_change_logging, request_change_logging_batch
@@ -30,8 +31,14 @@ from .common import (
 )
 from .counter_buffer import buffered_counter_updates
 from .counter_bypass import bypass_counter_updates
-from .differ import enter_prechange_cache, exit_prechange_cache, generate_changeset
-from .matcher import enter_request_obj_cache, exit_request_obj_cache
+from .differ import clear_prechange_cache, enter_prechange_cache, exit_prechange_cache, generate_changeset
+from .matcher import (
+    _get_active_branch_schema,
+    clear_request_obj_cache,
+    enter_request_obj_cache,
+    exit_request_obj_cache,
+    invalidate_find_obj_entry,
+)
 from .permissions import (
     SCOPE_NETBOX_READ,
     SCOPE_NETBOX_WRITE,
@@ -668,12 +675,41 @@ class BulkPlanApplyView(views.APIView):
         errors = result.get("errors") or {}
         return bool(errors.get("plan") or errors.get("apply"))
 
+    # Re-plans after StalePlan before the last attempt applies without the
+    # fresh-plan check (the pre-guard behaviour), so a row that keeps moving
+    # under one entity costs at most this many extra plans, never an error.
+    _MAX_REPLANS = 3
+
     def _process_entity(self, entry, branch_schema_id, request):
-        """Plan-then-apply one entity. Returns a dict with change_set + plan/apply errors."""
+        """
+        Plan-then-apply one entity. Returns a dict with change_set + plan/apply errors.
+
+        The apply runs under apply_guard (diode SPEC-20261124-1134): it refuses a
+        plan whose rows another batch wrote in the meantime (StalePlan), and the
+        entity is planned again against the current rows; and with the entry's
+        observed_at it keeps fields a newer observation already wrote.
+        """
         extracted = _extract_entity_data(entry)
         if extracted.error is not None:
             return {"change_set": None, "errors": {"plan": extracted.error}}
 
+        observed_at = parse_observed_at(entry.get("observed_at"))
+        branch = _get_active_branch_schema() or ""
+        for attempt in range(self._MAX_REPLANS + 1):
+            try:
+                with apply_guard(observed_at, branch, enforce_fresh_plan=attempt < self._MAX_REPLANS):
+                    return self._plan_and_apply(entry, extracted, branch_schema_id, request)
+            except StalePlan as e:
+                logger.info(
+                    "entity %s: %s; planning again (attempt %d)",
+                    _sanitize_for_log(entry.get("id")), e, attempt + 1,
+                )
+                invalidate_find_obj_entry(e.object_type, e.object_id)
+                clear_request_obj_cache()
+                clear_prechange_cache()
+        raise AssertionError("unreachable: the last attempt does not check for a stale plan")
+
+    def _plan_and_apply(self, entry, extracted, branch_schema_id, request):
         plan_result, plan_error = self._run_plan(
             extracted.entity_data,
             extracted.object_type,
